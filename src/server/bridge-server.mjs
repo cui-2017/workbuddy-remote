@@ -1,7 +1,9 @@
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { createReadStream } from "node:fs";
+import { appendFileSync, createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import zlib from "node:zlib";
 
@@ -45,8 +47,13 @@ const BROWSER_WS_MAX_PAYLOAD_BYTES = readPositiveIntegerEnv(
   512 * 1024 * 1024
 );
 const versionedScriptCompressionCache = new Map();
+let shimSyntaxChecked = false;
 const WORKBUDDY_ASAR_PATH = resolveWorkBuddyAsarPath();
 const workBuddyAsar = new AsarArchive(WORKBUDDY_ASAR_PATH);
+const DIAG_LOG_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../output/runtime/temp/diag.log"
+);
 const MODEL_SECRET_READ_METHODS = new Set([
   "configGet",
   "configGetAll",
@@ -870,8 +877,11 @@ async function sendMaybePatchedWorkBuddyAsset(req, res, archive, relativePath, c
   const shouldPatchMainIndex =
     /^index-[\w-]+\.js$/u.test(fileName) &&
     normalizedPath.startsWith("renderer/assets/");
+  const shouldPatchHomeCreation =
+    /^home-creation-[\w-]+\.js$/u.test(fileName) &&
+    normalizedPath.startsWith("renderer/assets/");
 
-  if (!shouldPatchGrowthBuddy && !shouldPatchMainIndex) {
+  if (!shouldPatchGrowthBuddy && !shouldPatchMainIndex && !shouldPatchHomeCreation) {
     await sendAsarAsset(req, res, archive, relativePath, cacheControl);
     return;
   }
@@ -897,6 +907,79 @@ async function sendMaybePatchedWorkBuddyAsset(req, res, archive, relativePath, c
   }
   if (shouldPatchMainIndex && patched.includes(wecomStatusUnhandledFrom)) {
     patched = patched.replace(wecomStatusUnhandledFrom, wecomStatusUnhandledTo);
+  }
+  if (shouldPatchHomeCreation) {
+    // 任何一个锚点没命中都显式告警：之前这些替换都是静默跳过，导致“看着打了补丁其实没打”。
+    const missedAnchors = [];
+    const applyAnchor = (label, from, to) => {
+      if (patched.includes(from)) {
+        patched = patched.replace(from, to);
+        return true;
+      }
+      missedAnchors.push(label);
+      return false;
+    };
+
+    // 【已回滚】关闭首页预创建（prewarm）。
+    // 原因：prewarm 关掉后，create 出来的会话没有任何运行时持有，也不会写 session-meta 到 jsonl，
+    // 结果 sessions 表里留下 status=working 的空会话；之后再打开/切换该会话时
+    // ConversationProviderRouter 查不到 provider，抛 `e.content.map is not a function`，
+    // 界面上就是「会话记录损坏，请新建任务 4010」和「未知错误 暂无响应」。
+    // 当初「按发送无反应」的真因是 ownsSubmissionSurface + 配置调用阻塞（下面两条已单独修好），
+    // 与 prewarm 无关，因此这里必须恢复原逻辑，让新会话有真实运行时和初始记录。
+    // const prewarmEnabledFrom = "function isHomeTaskPrewarmEnabled(){try{return globalThis.localStorage?.getItem(Gs)!==`0`}catch{return!0}}";
+    // const prewarmEnabledTo = "function isHomeTaskPrewarmEnabled(){try{return!1}catch{return!1}}";
+    // applyAnchor("prewarmEnabled", prewarmEnabledFrom, prewarmEnabledTo);
+
+    // 新建任务后写“上下文窗口 / 思考等级”这两个配置调用，在远程桥接下会一直不返回，
+    // 把整个提交流程卡死（会话已创建但永远不跳转、也不发首条消息）。这里改成不阻塞提交。
+    const contextWindowFrom =
+      "let e=await K.configManager.setContextWindow(String(i));isApiError(e)&&console.warn(`[Home] Failed to apply new-task context window:`,e.message)";
+    const contextWindowTo =
+      "try{Promise.resolve(K.configManager.setContextWindow(String(i))).catch(()=>void 0)}catch{}";
+    applyAnchor("contextWindow", contextWindowFrom, contextWindowTo);
+
+    const thoughtLevelFrom =
+      "let e=await K.configManager.setThoughtLevel(a);isApiError(e)&&console.warn(`[Home] Failed to apply new-task thought level:`,e.message)";
+    const thoughtLevelTo =
+      "try{Promise.resolve(K.configManager.setThoughtLevel(a)).catch(()=>void 0)}catch{}";
+    applyAnchor("thoughtLevel", thoughtLevelFrom, thoughtLevelTo);
+
+    // “捕获任务资源”会 await 内置浏览器的 bindSession；远程浏览器里没有任何宿主浏览器，
+    // 这个 promise 永不返回，于是 create 之后整条提交链路卡死。这里加 1.2s 上限并放行。
+    const captureResourcesFrom = "return n&&e?async t=>{await e(t),n.bindSession(t)}:void 0";
+    const captureResourcesTo =
+      "return n&&e?async t=>{try{await Promise.race([Promise.resolve(e(t)),new Promise(r=>setTimeout(r,1200))])}catch{}try{n.bindSession(t)}catch{}}:void 0";
+    applyAnchor("captureTaskResources", captureResourcesFrom, captureResourcesTo);
+
+    // 根因：ownsSubmissionSurface() = L(A) && (!isCloud || pageAliveRef.current)。
+    // 它一旦为 false，会话照样创建、首条消息照样发出去，但 complete() 会整个跳过
+    // `le(...)/je(...)/navigation.navigate(buildConversationPath(...))`，于是浏览器停在
+    // 首页不动、也看不到气泡（侧边栏里那条会话其实已经在跑）。远程桥接下这个判定不可靠，
+    // 这里固定为 true，保证提交完成后一定跳进新会话。
+    const ownsSurfaceFrom = "ownsSubmissionSurface=()=>L(A)&&(!t||m.current)";
+    const ownsSurfaceTo =
+      'ownsSubmissionSurface=()=>{let __v=!1;try{__v=L(A)&&(!t||m.current)}catch(e){}try{console.warn("[HomeOwns] owns="+__v)}catch(e){}return!0}';
+    applyAnchor("ownsSubmissionSurface", ownsSurfaceFrom, ownsSurfaceTo);
+
+    // 资源交接失败时原来直接 throw HomeTaskResourceHandoffError，把后面的跳转一起掐掉。
+    // 远程环境里交接本来就不可用，改成只告警、继续往下走。
+    const handoffFrom = "try{await T?.(q)}catch(e){throw new HomeTaskResourceHandoffError(e)}";
+    const handoffTo =
+      'try{await T?.(q);try{console.warn("[HomeOwns] handoff ok")}catch(e){}}catch(e){try{console.warn("[HomeOwns] handoff fail: "+(e&&e.message))}catch(e2){}}';
+    applyAnchor("resourceHandoff", handoffFrom, handoffTo);
+
+    // 跳转不再交给这里。原因：这个 chunk 带 `Cache-Control: immutable`（一年），浏览器
+    // 永远不会回源，补丁实际上到不了客户端；而且真到了也会和 shim 的跳转互相抢。
+    // 现在统一由 shim 的 __wbHomeSubmitWatchdog 负责“补发首条消息 + 重载 + 点开会话”。
+
+    if (missedAnchors.length > 0) {
+      console.warn(
+        `[WorkbuddyAdapter] home-creation 补丁锚点未命中: ${missedAnchors.join(", ")}（WorkBuddy 升级后需重新取锚点）`
+      );
+    } else {
+      console.info("[WorkbuddyAdapter] home-creation 补丁全部命中");
+    }
   }
   if (shouldPatchMainIndex) {
     const sidebarToggleExposeFrom =
@@ -1007,9 +1090,17 @@ async function sendMaybePatchedWorkBuddyAsset(req, res, archive, relativePath, c
     patched = patchMainIndexLongSessionLoading(patched);
   }
 
+  // 补丁版资源必须能回源：
+  // 原来这里一律用 `public, max-age=31536000, immutable`，ETag 又只拼了「文件名+长度」。
+  // 于是改了补丁内容但长度碰巧一样时，浏览器直接 304 / 根本不发请求，补丁永远到不了客户端
+  // —— 之前多轮“改了没生效”全部源于此。现在补丁版改成 max-age=0 + 内容哈希 ETag，
+  // 普通 F5 就能拿到新补丁；未打补丁的第三方 chunk 仍走 immutable，保持原来的性能。
+  const patchChanged = patched !== original;
   sendVersionedScript(req, res, patched, {
-    etag: `"workbuddy-asset-${fileName}-${patched.length}"`,
-    cacheControl,
+    etag: patchChanged
+      ? `"workbuddy-patched-${fileName}-${createHash("sha1").update(patched).digest("hex").slice(0, 20)}"`
+      : `"workbuddy-asset-${fileName}-${patched.length}"`,
+    cacheControl: patchChanged ? REVALIDATED_STATIC_CACHE_CONTROL : cacheControl,
   });
 }
 
@@ -1288,6 +1379,27 @@ function createRequestHandler(runtime, auth) {
         return;
       }
 
+      if (requestUrl.pathname === "/bridge/diag") {
+        const chunks = [];
+        for await (const chunk of req) {
+          chunks.push(chunk);
+          if (chunks.reduce((sum, item) => sum + item.length, 0) > 64 * 1024) {
+            break;
+          }
+        }
+        const body = Buffer.concat(chunks).toString("utf8").slice(0, 20000);
+        try {
+          appendFileSync(DIAG_LOG_PATH, body + "\n", "utf8");
+        } catch (error) {
+          logger.warn("bridge.diag.write_failed", "Failed to persist browser diagnostic", {
+            error: String(error && error.message),
+          });
+        }
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       if (requestUrl.pathname === "/bridge/workbuddy-native-shim.js") {
         const [methods, version, locale, features, bridgeUiConfig] = await Promise.all([
           runtime.getBuddyApiMethods(),
@@ -1303,6 +1415,20 @@ function createRequestHandler(runtime, auth) {
           ...features,
           ...bridgeUiConfig,
         });
+        // 这份 shim 由模板字符串拼装，一旦拼出语法错误，浏览器里 window.wb 会整个缺失，
+        // 表现为“页面能打开但什么都不工作”。这里做一次编译校验（只解析不执行）。
+        if (!shimSyntaxChecked) {
+          shimSyntaxChecked = true;
+          try {
+            new Function(shim);
+          } catch (error) {
+            logger.warn(
+              "bridge.shim.invalid_syntax",
+              "生成的 workbuddy-native-shim.js 存在语法错误，浏览器端会整体失效",
+              { error: String(error && error.message) }
+            );
+          }
+        }
         sendVersionedScript(
           req,
           res,
@@ -1486,7 +1612,21 @@ function attachWebSocketServer(server, runtime, auth) {
         }
 
         if (message.type === "wb-invoke") {
+          const startedAt = Date.now();
           const result = await runtime.invokeWbIpc(message.channel, message.context, message.args || []);
+          let resultLength = -1;
+          try {
+            resultLength = JSON.stringify(result)?.length ?? 0;
+          } catch {
+            resultLength = -2;
+          }
+          logger.debug("bridge.wb_invoke", "Forwarded browser wb-invoke to WorkBuddy", {
+            channel: message.channel,
+            contextKeys: message.context && typeof message.context === "object" ? Object.keys(message.context) : [],
+            argsLength: Array.isArray(message.args) ? message.args.length : 0,
+            resultLength,
+            elapsedMs: Date.now() - startedAt,
+          });
           runtime.sendToSocket(socket, {
             id: message.id,
             ok: true,
@@ -1497,6 +1637,9 @@ function attachWebSocketServer(server, runtime, auth) {
 
         if (message.type === "wb-subscribe") {
           await runtime.subscribeWbEvent(message.channel, socket);
+          logger.debug("bridge.wb_subscribe", "Browser subscribed to WorkBuddy event", {
+            channel: message.channel,
+          });
           runtime.sendToSocket(socket, {
             id: message.id,
             ok: true,
@@ -1511,6 +1654,24 @@ function attachWebSocketServer(server, runtime, auth) {
             id: message.id,
             ok: true,
             result: true,
+          });
+          return;
+        }
+
+        if (message.type === "terminal-call") {
+          const startedAt = Date.now();
+          const result = await runtime.callDesktopTerminal(message.method, message.args || []);
+          // poll 每 16ms 一次，逐条打日志会把日志打爆，只记录非 poll 操作。
+          if (message.method !== "poll") {
+            logger.debug("bridge.terminal_call", "Forwarded browser terminal call to WorkBuddy", {
+              method: message.method,
+              elapsedMs: Date.now() - startedAt,
+            });
+          }
+          runtime.sendToSocket(socket, {
+            id: message.id,
+            ok: true,
+            result,
           });
           return;
         }

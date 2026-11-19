@@ -2338,6 +2338,17 @@ class BridgeRuntime {
 
     socket.on("message", (raw) => {
       const text = raw.toString();
+      if (!this.daemonFrameStats) {
+        this.daemonFrameStats = { toDesktop: 0, toBrowser: 0 };
+      }
+      this.daemonFrameStats.toDesktop += 1;
+      if (this.daemonFrameStats.toDesktop <= 40) {
+        logger.debug("daemon_transport.frame_to_desktop", "Forwarded browser daemon frame into WorkBuddy", {
+          socketId,
+          seq: this.daemonFrameStats.toDesktop,
+          bytes: text.length,
+        });
+      }
       this.withCdpRecovery(() =>
         this.cdp.evaluate(
           `globalThis.__workbuddyRemoteDaemon.recv(${socketId}, ${JSON.stringify(text)})`
@@ -2387,8 +2398,45 @@ class BridgeRuntime {
     });
   }
 
-  async subscribeWbEvent(channel, socket) {
-    const key = `wbOn:${channel}`;
+  // 桌面端 pty 终端桥（window.__workbuddyDevtoolsTerminal）代理。
+  // 浏览器里没有 preload 注入的该对象，界面右侧「终端」页会直接判为不支持；
+  // 这里把调用转发到桌面窗口的同一对象上，让浏览器也能读写本地终端。
+  async callDesktopTerminal(method, args) {
+    const allowed = new Set([
+      "list",
+      "create",
+      "close",
+      "rename",
+      "attach",
+      "poll",
+      "input",
+      "resize",
+      "detach",
+    ]);
+    const terminalMethod = String(method || "");
+    if (!allowed.has(terminalMethod)) {
+      throw new Error(`Unsupported terminal method: ${terminalMethod}`);
+    }
+    const rawArgs = JSON.stringify(Array.isArray(args) ? args : []);
+    const rawMethod = JSON.stringify(terminalMethod);
+    return this.withCdpRecovery(async () => {
+      const value = await this.cdp.evaluate(
+        `(async () => {
+          const desktopTerminal = globalThis.__workbuddyDevtoolsTerminal;
+          if (!desktopTerminal) { throw new Error("WorkBuddy terminal bridge is unavailable in the desktop window"); }
+          const methodName = ${rawMethod};
+          const fn = desktopTerminal[methodName];
+          if (typeof fn !== "function") { throw new Error("WorkBuddy terminal method is missing: " + methodName); }
+          const result = await fn.apply(desktopTerminal, ${rawArgs});
+          return result === undefined ? null : result;
+        })()`,
+        { timeoutMs: WORKBUDDY_RPC_DEFAULT_TIMEOUT_MS }
+      );
+      return value;
+    });
+  }
+
+  async subscribeWbEvent(channel, socket) {    const key = `wbOn:${channel}`;
     const current = this.wbEventRefCounts.get(key);
     if (!current) {
       await this.withCdpRecovery(() =>
@@ -2470,6 +2518,17 @@ class BridgeRuntime {
     });
 
     if (payload.type === "daemon-frame") {
+      if (!this.daemonFrameStats) {
+        this.daemonFrameStats = { toDesktop: 0, toBrowser: 0 };
+      }
+      this.daemonFrameStats.toBrowser += 1;
+      if (this.daemonFrameStats.toBrowser <= 40) {
+        logger.debug("daemon_transport.frame_to_browser", "Forwarded daemon frame from WorkBuddy to browser", {
+          socketId: payload.socketId,
+          seq: this.daemonFrameStats.toBrowser,
+          bytes: typeof payload.data === "string" ? payload.data.length : -1,
+        });
+      }
       const daemonSocket = this.daemonSockets.get(payload.socketId);
       if (daemonSocket) {
         this.sendToSocket(daemonSocket, payload.data);
@@ -2478,11 +2537,31 @@ class BridgeRuntime {
     }
 
     if (payload.type === "wb-event") {
+      if (!this.loggedEventChannels) {
+        this.loggedEventChannels = new Set();
+      }
+      if (!this.loggedEventChannels.has(payload.channel) && this.loggedEventChannels.size < 200) {
+        this.loggedEventChannels.add(payload.channel);
+        logger.debug("bridge.wb_event.first", "First WorkBuddy event on channel reached browser", {
+          channel: payload.channel,
+          argCount: Array.isArray(payload.args) ? payload.args.length : 0,
+        });
+      }
       this.broadcast({ type: "wb-event", channel: payload.channel, args: payload.args });
       return;
     }
 
     if (payload.type === "wb-event-all") {
+      if (!this.loggedEventChannels) {
+        this.loggedEventChannels = new Set();
+      }
+      const key = "all:" + payload.event;
+      if (!this.loggedEventChannels.has(key) && this.loggedEventChannels.size < 200) {
+        this.loggedEventChannels.add(key);
+        logger.debug("bridge.wb_event_all.first", "First global WorkBuddy event reached browser", {
+          event: payload.event,
+        });
+      }
       this.broadcast({ type: "wb-event-all", event: payload.event, args: payload.args });
       return;
     }

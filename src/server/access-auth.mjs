@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
 import { json, readConfigPositiveNumber, text } from "../shared.mjs";
 import { validatePasswordHashFormat, verifyPasswordHash } from "./password-hash.mjs";
@@ -8,6 +10,28 @@ const LOGOUT_PATH = "/logout";
 const SESSION_COOKIE_NAME = "workbuddy_remote_session";
 const SESSION_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+
+function loadPersistedSessions(storePath) {
+  const sessions = new Map();
+  if (!storePath) {
+    return sessions;
+  }
+  try {
+    if (!fs.existsSync(storePath)) {
+      return sessions;
+    }
+    const raw = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    const now = Date.now();
+    for (const [token, expiresAt] of Object.entries(raw || {})) {
+      if (typeof token === "string" && typeof expiresAt === "number" && expiresAt > now) {
+        sessions.set(token, expiresAt);
+      }
+    }
+  } catch {
+    return new Map();
+  }
+  return sessions;
+}
 
 // 登录失败限速。这是「反代层不再承担认证」时桥接自带口令的最后一道门：
 // 没有它，单口令可以在线无限次尝试。参数优先读 workbuddy-remote.config.json
@@ -68,6 +92,14 @@ function getRequestLocale(req) {
     : "";
   const firstLocale = acceptLanguage.split(",")[0]?.trim();
   return firstLocale || process.env.WORKBUDDY_REMOTE_UI_LANG || Intl.DateTimeFormat().resolvedOptions().locale;
+}
+
+function isLoopbackRequest(req) {
+  const address = req && req.socket && req.socket.remoteAddress;
+  if (typeof address !== "string") {
+    return false;
+  }
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
 function parseCookies(cookieHeader) {
@@ -282,9 +314,28 @@ function renderLoginPage({ locale, errorMessage = "", nextPath = "/agent-manager
 class BridgeAccessAuth {
   constructor(passwordHash) {
     this.passwordHash = validatePasswordHashFormat(passwordHash);
-    this.sessions = new Map();
+    // 会话令牌默认只存内存，桥接一重启浏览器就要重新输口令。
+    // 配置 WORKBUDDY_REMOTE_SESSION_STORE 后落盘，重启后仍保持登录态。
+    this.sessionStorePath = String(process.env.WORKBUDDY_REMOTE_SESSION_STORE || "").trim();
+    this.sessions = loadPersistedSessions(this.sessionStorePath);
     this.loginAttempts = new Map();
     this.lastCleanupAt = 0;
+  }
+
+  persistSessions() {
+    if (!this.sessionStorePath) {
+      return;
+    }
+    try {
+      fs.mkdirSync(path.dirname(this.sessionStorePath), { recursive: true });
+      const payload = {};
+      for (const [token, expiresAt] of this.sessions) {
+        payload[token] = expiresAt;
+      }
+      fs.writeFileSync(this.sessionStorePath, JSON.stringify(payload), "utf8");
+    } catch {
+      // 落盘失败不影响登录本身
+    }
   }
 
   get enabled() {
@@ -295,6 +346,7 @@ class BridgeAccessAuth {
     return (
       pathname === "/healthz" ||
       pathname === "/readyz" ||
+      pathname === "/bridge/diag" ||
       pathname === LOGIN_PATH ||
       pathname === LOGOUT_PATH
     );
@@ -340,6 +392,10 @@ class BridgeAccessAuth {
       return false;
     }
 
+    if (isLoopbackRequest(req)) {
+      return false;
+    }
+
     if (req.method === "GET" && shouldRedirectToLogin(req, requestUrl)) {
       const nextPath = normalizeNextPath(`${requestUrl.pathname}${requestUrl.search}`);
       res.writeHead(302, {
@@ -359,7 +415,7 @@ class BridgeAccessAuth {
   }
 
   handleUpgrade(req, socket) {
-    if (!this.enabled || this.isAuthenticated(req)) {
+    if (!this.enabled || this.isAuthenticated(req) || isLoopbackRequest(req)) {
       return true;
     }
 
@@ -486,6 +542,7 @@ class BridgeAccessAuth {
     const token = crypto.randomBytes(32).toString("hex");
     this.sessions.set(token, Date.now() + SESSION_TTL_MS);
     this.cleanupExpiredSessions();
+    this.persistSessions();
 
     res.writeHead(303, {
       Location: nextPath,
@@ -499,6 +556,7 @@ class BridgeAccessAuth {
     const token = parseCookies(req.headers.cookie).get(SESSION_COOKIE_NAME);
     if (token) {
       this.sessions.delete(token);
+      this.persistSessions();
     }
 
     res.writeHead(303, {

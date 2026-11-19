@@ -362,7 +362,8 @@ if (-not $PSBoundParameters.ContainsKey("UserDataDir") -or [string]::IsNullOrWhi
     }
 }
 if (-not $PSBoundParameters.ContainsKey("PasswordHash") -or [string]::IsNullOrWhiteSpace($PasswordHash)) {
-    $PasswordHash = $env:WORKBUDDY_REMOTE_PASSWORD_HASH
+    $configuredPasswordHash = Get-ConfigString -Config $config -Name "passwordHash"
+    $PasswordHash = if ($configuredPasswordHash) { $configuredPasswordHash } else { $env:WORKBUDDY_REMOTE_PASSWORD_HASH }
 }
 if (-not $PSBoundParameters.ContainsKey("KillWorkBuddyProcessesBeforeStart")) {
     $KillWorkBuddyProcessesBeforeStart = Get-ConfigBool -Config $config -Name "killWorkBuddyProcessesBeforeStart" -Fallback $false

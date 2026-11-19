@@ -3963,6 +3963,93 @@ function renderWorkBuddyNativeShimJs({
     }).catch(() => {});
   }
 
+  // 最近一次事件载荷缓存：前端 SDK 往往晚于首批事件就绪，订阅成立后需要重放一次，
+  // 否则「最近」列表这类只发一次的启动事件会被永久错过。
+  const eventReplayCache = new Map();
+  const EVENT_REPLAY_LIMIT = 240;
+
+  function rememberEventForReplay(eventName, payload) {
+    try {
+      if (eventReplayCache.has(eventName)) {
+        eventReplayCache.delete(eventName);
+      }
+      eventReplayCache.set(eventName, payload);
+      while (eventReplayCache.size > EVENT_REPLAY_LIMIT) {
+        const oldest = eventReplayCache.keys().next();
+        if (oldest.done) {
+          break;
+        }
+        eventReplayCache.delete(oldest.value);
+      }
+    } catch (error) {
+      void error;
+    }
+  }
+
+  function emitToSdkBus(eventName, payload) {
+    try {
+      const sdk = globalThis.wb;
+      const bus = sdk && sdk.$bus;
+      if (!bus || typeof bus.emit !== "function") {
+        return false;
+      }
+      bus.emit(eventName, payload);
+      return true;
+    } catch (error) {
+      console.error("[workbuddy-remote] sdk bus dispatch failed", eventName, error);
+      return false;
+    }
+  }
+
+  function replayEventsToSdkBus() {
+    try {
+      const sdk = globalThis.wb;
+      const bus = sdk && sdk.$bus;
+      if (!bus || typeof bus.emit !== "function" || eventReplayCache.size === 0) {
+        return 0;
+      }
+      if (bus.__wbRemoteReplayed) {
+        return 0;
+      }
+      Object.defineProperty(bus, "__wbRemoteReplayed", { value: true, configurable: true });
+      let count = 0;
+      for (const [eventName, payload] of eventReplayCache) {
+        try {
+          bus.emit(eventName, payload);
+          count += 1;
+        } catch (error) {
+          void error;
+        }
+      }
+      return count;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  function replayCachedEventToHandler(eventName, handler) {
+    if (typeof handler !== "function" || !eventReplayCache.has(eventName)) {
+      return false;
+    }
+    const payload = eventReplayCache.get(eventName);
+    setTimeout(() => {
+      try {
+        handler(payload);
+      } catch (error) {
+        console.error("[workbuddy-remote] replay handler failed", eventName, error);
+      }
+    }, 0);
+    return true;
+  }
+
+  try {
+    globalThis.__wbReplayEvents = replayEventsToSdkBus;
+    globalThis.__wbEmitToSdkBus = emitToSdkBus;
+    globalThis.__wbReplayToHandler = replayCachedEventToHandler;
+  } catch (error) {
+    void error;
+  }
+
   function handleBridgeMessage(message) {
     if (message.id && pending.has(message.id)) {
       const entry = pending.get(message.id);
@@ -3991,14 +4078,25 @@ function renderWorkBuddyNativeShimJs({
     }
 
     if (message.type === "wb-event-all") {
+      const payload = decodeTransport(message.args && message.args[0]);
+      const eventName = String(message.event);
+      rememberEventForReplay(eventName, payload);
       const bridgeCallback = globalThis.__wbEventBridgeCallback;
       if (typeof bridgeCallback === "function") {
         try {
-          bridgeCallback(message.event, decodeTransport(message.args && message.args[0]));
+          bridgeCallback(message.event, payload);
         } catch (error) {
           console.error("[workbuddy-remote] wb event bridge callback failed", error);
         }
       }
+      const hostEvents = globalThis.__wbHostEvents;
+      if (hostEvents && typeof hostEvents.emit === "function") {
+        hostEvents.emit(message.event, payload);
+      }
+      // 关键：前端真正的订阅层是 window.wb（WBBus）。宿主事件必须同时投递到
+      // wb.$bus，否则 wb.on('wb:conversations:listChanged') 注册的回调永远收不到，
+      // 侧栏「最近」为空、会话对象缺字段（welcomeMode/sourceMode）都会由此产生。
+      emitToSdkBus(eventName, payload);
       return;
     }
 
@@ -4474,19 +4572,354 @@ function renderWorkBuddyNativeShimJs({
 
   globalThis.buddyAPI = buddyApi;
 
+  // ===== 桌面端 pty 终端桥：window.__workbuddyDevtoolsTerminal =====
+  // 桌面端由 preload 注入该对象，浏览器里没有，于是右侧「终端」页直接显示
+  // 「当前环境不支持本地终端」。这里按同一套方法名做代理，转发到桌面窗口执行。
+  (() => {
+    if (globalThis.__workbuddyDevtoolsTerminal) {
+      return;
+    }
+    const makeCall = (method) =>
+      function (...args) {
+        return request({
+          type: "terminal-call",
+          method: method,
+          args: args,
+        });
+      };
+    const terminalBridge = {
+      list: makeCall("list"),
+      create: makeCall("create"),
+      close: makeCall("close"),
+      rename: makeCall("rename"),
+      attach: makeCall("attach"),
+      poll: makeCall("poll"),
+      input: makeCall("input"),
+      resize: makeCall("resize"),
+      detach: makeCall("detach"),
+    };
+    globalThis.__workbuddyDevtoolsTerminal = terminalBridge;
+    globalThis.__wbRemoteTerminalBridgeInstalled = true;
+  })();
+
   // ===== WorkBuddy desktop host stub (v37+ WebUI requires window.workbuddyDesktop) =====
   if (!globalThis.workbuddyDesktop || typeof globalThis.workbuddyDesktop !== "object") {
     globalThis.workbuddyDesktop = {
       invoke() {
         return Promise.resolve(undefined);
       },
-      events: {
-        on() {
-          return () => {};
-        },
-      },
+      events: {},
     };
   }
+
+  // ===== Host event bus: workbuddyDesktop.events.on must actually deliver =====
+  // 5.11.3 的前端改用 workbuddyDesktop.events.on(name, handler) 订阅宿主事件。
+  // 原垫片把 on() 实现成空函数，导致 listChanged / promptDispatched 等事件
+  // 全部被丢弃：侧栏会话列表不刷新、发消息后界面无回执。
+  (() => {
+    if (globalThis.__workbuddyHostEventBusInstalled) {
+      return;
+    }
+    globalThis.__workbuddyHostEventBusInstalled = true;
+
+    const registry = new Map();
+    const hostEvents = {
+      on(eventName, handler) {
+        if (typeof handler !== "function") {
+          return () => {};
+        }
+        const key = String(eventName);
+        let handlers = registry.get(key);
+        if (!handlers) {
+          handlers = new Set();
+          registry.set(key, handlers);
+        }
+        handlers.add(handler);
+        return () => {
+          const current = registry.get(key);
+          if (current) {
+            current.delete(handler);
+            if (current.size === 0) {
+              registry.delete(key);
+            }
+          }
+        };
+      },
+      off(eventName, handler) {
+        const current = registry.get(String(eventName));
+        if (current && typeof handler === "function") {
+          current.delete(handler);
+        }
+      },
+      emit(eventName, payload) {
+        const current = registry.get(String(eventName));
+        if (!current) {
+          return;
+        }
+        for (const handler of [...current]) {
+          try {
+            handler(payload, String(eventName));
+          } catch (error) {
+            console.error("[workbuddy-remote] host event handler failed", eventName, error);
+          }
+        }
+      },
+    };
+    Object.defineProperty(hostEvents, "__wbEventBusInstalled", {
+      value: true,
+      enumerable: false,
+      configurable: false,
+    });
+    globalThis.workbuddyDesktop.events = hostEvents;
+    globalThis.__wbHostEventRegistry = registry;
+    globalThis.__wbHostEvents = hostEvents;
+  })();
+
+  // ===== Browser-side diagnostics (temporary, read-only) =====
+  (() => {
+    if (globalThis.__workbuddyDiagInstalled) {
+      return;
+    }
+    globalThis.__workbuddyDiagInstalled = true;
+
+    const sendDiag = (event, data) => {
+      try {
+        const body = JSON.stringify({
+          event: event,
+          data: data,
+          href: String(location.href),
+          ts: Date.now(),
+        });
+        fetch("/bridge/diag", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: body,
+          keepalive: true,
+        }).catch(() => {});
+      } catch (error) {
+        void error;
+      }
+    };
+    globalThis.__wbDiag = sendDiag;
+
+    const LINE_BREAK = String.fromCharCode(10);
+    const stackOf = () => {
+      try {
+        return String(new Error().stack || "")
+          .split(LINE_BREAK)
+          .slice(1, 8)
+          .join(" <- ")
+          .slice(0, 500);
+      } catch (error) {
+        return "";
+      }
+    };
+
+    const emitCounts = {};
+
+    const bus = globalThis.__wbHostEvents;
+    if (bus && typeof bus.on === "function") {
+      const originalOn = bus.on;
+      bus.on = function (eventName, handler) {
+        sendDiag("bus.on", { name: String(eventName), stack: stackOf() });
+        return originalOn.call(bus, eventName, handler);
+      };
+    } else {
+      sendDiag("bus.missing", {});
+    }
+
+    if (bus && typeof bus.emit === "function") {
+      const originalEmit = bus.emit;
+      bus.emit = function (eventName, payload) {
+        const name = String(eventName);
+        emitCounts[name] = (emitCounts[name] || 0) + 1;
+        if (emitCounts[name] <= 2) {
+          const registry = globalThis.__wbHostEventRegistry;
+          let listeners = -1;
+          if (registry && typeof registry.get === "function") {
+            const set = registry.get(name);
+            listeners = set ? set.size : 0;
+          }
+          sendDiag("bus.emit", {
+            name: name,
+            listeners: listeners,
+            payloadType: typeof payload,
+          });
+        }
+        return originalEmit.call(bus, eventName, payload);
+      };
+    }
+
+    window.addEventListener("error", (event) => {
+      sendDiag("window.error", {
+        message: String(event && event.message).slice(0, 300),
+        source: String((event && event.filename) || "").slice(0, 200),
+        line: event && event.lineno,
+      });
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event && event.reason;
+      sendDiag("unhandledrejection", {
+        message: String((reason && reason.message) || reason).slice(0, 400),
+        stack: String((reason && reason.stack) || "").slice(0, 700),
+      });
+    });
+
+    sendDiag("boot", {
+      platform: navigator.platform,
+      ua: navigator.userAgent.slice(0, 140),
+      hostKeys: globalThis.workbuddyDesktop
+        ? Object.keys(globalThis.workbuddyDesktop).slice(0, 40)
+        : null,
+    });
+
+    setTimeout(() => {
+      const registry = globalThis.__wbHostEventRegistry;
+      const registryNames = [];
+      if (registry && typeof registry.forEach === "function") {
+        registry.forEach((value, key) => {
+          registryNames.push(key + "(" + (value && value.size) + ")");
+        });
+      }
+      sendDiag("snapshot.6s", {
+        registered: registryNames.slice(0, 100),
+        registeredTotal: registryNames.length,
+        emitCounts: emitCounts,
+      });
+    }, 6000);
+
+    setTimeout(() => {
+      try {
+        const text = document.body && document.body.innerText ? document.body.innerText : "";
+        sendDiag("snapshot.14s", {
+          textLength: text.length,
+          textHead: text.slice(0, 1200),
+          emitCounts: emitCounts,
+        });
+      } catch (error) {
+        sendDiag("snapshot.failed", { message: String(error && error.message) });
+      }
+    }, 14000);
+
+    // ===== SDK 层观测：wb.on 到底有没有被调用 =====
+    const reportSdk = (tag) => {
+      const wb = globalThis.wb;
+      const info = {
+        tag: tag,
+        wbType: typeof wb,
+        ipcRendererType: typeof (globalThis.workbuddyDesktop && globalThis.workbuddyDesktop.ipcRenderer),
+      };
+      if (wb && typeof wb === "object") {
+        try {
+          info.keys = Object.keys(wb).slice(0, 60);
+        } catch (error) {
+          info.keysError = String(error && error.message);
+        }
+        info.hasOn = typeof wb.on;
+        info.hasOnAny = typeof wb.onAny;
+        info.hasBus = typeof wb.$bus;
+        info.channelsType = typeof wb.channels;
+        if (wb.channels && typeof wb.channels === "object") {
+          try {
+            info.channels = Object.keys(wb.channels).slice(0, 40);
+          } catch (error) {
+            void error;
+          }
+        }
+      }
+      sendDiag("sdk.snapshot", info);
+    };
+
+    const wrapSdkSubscriber = () => {
+      const wb = globalThis.wb;
+      if (!wb || typeof wb !== "object") {
+        return false;
+      }
+      if (wb.__wbDiagWrappedOn) {
+        return true;
+      }
+      try {
+        if (typeof wb.on === "function") {
+          const originalOn = wb.on;
+          wb.on = function (name, handler) {
+            sendDiag("sdk.on", { name: String(name), stack: stackOf() });
+            const unsubscribe = originalOn.call(wb, name, handler);
+            try {
+              const replay = globalThis.__wbReplayToHandler;
+              if (typeof replay === "function") {
+                replay(String(name), handler);
+              }
+            } catch (error) {
+              void error;
+            }
+            return unsubscribe;
+          };
+        }
+        if (typeof wb.onAny === "function") {
+          const originalOnAny = wb.onAny;
+          wb.onAny = function (handler) {
+            sendDiag("sdk.onAny", { stack: stackOf() });
+            return originalOnAny.call(wb, handler);
+          };
+        }
+        Object.defineProperty(wb, "__wbDiagWrappedOn", { value: true });
+        const bus = wb.$bus;
+        if (bus && typeof bus.emit === "function" && typeof bus.on === "function") {
+          const originalBusEmit = bus.emit;
+          const busCounts = {};
+          bus.emit = function (name) {
+            const key = String(name);
+            busCounts[key] = (busCounts[key] || 0) + 1;
+            if (busCounts[key] <= 2) {
+              let listenerCount = -1;
+              try {
+                listenerCount = typeof bus.listenerCount === "function" ? bus.listenerCount(key) : -1;
+              } catch (error) {
+                void error;
+              }
+              sendDiag("sdk.bus.emit", { name: key, listeners: listenerCount });
+            }
+            return originalBusEmit.apply(bus, arguments);
+          };
+        }
+        return true;
+      } catch (error) {
+        sendDiag("sdk.wrap.failed", { message: String(error && error.message) });
+        return false;
+      }
+    };
+
+    reportSdk("boot");
+    [2500, 6000, 11000].forEach((delay) => {
+      setTimeout(() => {
+        try {
+          const replay = globalThis.__wbReplayEvents;
+          if (typeof replay === "function") {
+            const replayed = replay();
+            if (replayed) {
+              sendDiag("sdk.replay", { count: replayed });
+            }
+          }
+        } catch (error) {
+          void error;
+        }
+      }, delay);
+    });
+    let sdkWrapTries = 0;
+    const sdkWrapTimer = setInterval(() => {
+      sdkWrapTries += 1;
+      const wrapped = wrapSdkSubscriber();
+      if (wrapped || sdkWrapTries >= 20) {
+        clearInterval(sdkWrapTimer);
+        if (wrapped) {
+          reportSdk("wrapped");
+        } else {
+          sendDiag("sdk.wrap.gaveup", { tries: sdkWrapTries });
+        }
+      }
+    }, 500);
+    setTimeout(() => reportSdk("14s"), 14000);
+  })();
 
   // ===== Daemon transport forwarder: relay MessagePort frames over /bridge/daemon =====
   if (!globalThis.__workbuddyRemoteDaemonForwarderInstalled) {
@@ -4568,6 +5001,643 @@ function renderWorkBuddyNativeShimJs({
       args: await encodeValue(args),
     });
 
+  // ===== 观测发送/终止链路的目标会话 (temporary) =====
+  (() => {
+    const watchList = [
+      "wb:conversations:sendPrompt",
+      "wb:conversations:cancelByUser",
+      "wb:conversations:cancel",
+      "wb:conversations:create",
+      "wb:conversations:resend",
+      "wb:conversations:setCurrentConversation",
+      "wb:conversations:ensureRuntime",
+    ];
+    const watch = new Set(watchList);
+    const viewList = [
+      "wb:conversations:get",
+      "wb:conversations:requests",
+      "wb:conversations:requestEntries",
+      "wb:conversations:queueItems",
+      "wb:conversations:ensureRuntime",
+    ];
+    const view = new Set(viewList);
+    const lastViewed = { id: null, channel: null, at: 0 };
+    const describe = (value) => {
+      if (typeof value === "string") {
+        return value;
+      }
+      try {
+        const text = JSON.stringify(value);
+        return text === undefined ? String(value) : text.slice(0, 160);
+      } catch (error) {
+        return "[unserializable]";
+      }
+    };
+    const readIds = () => {
+      const result = { currentId: null, currentInfoId: null };
+      try {
+        const conv = globalThis.wb && globalThis.wb.conversations;
+        if (!conv) {
+          return result;
+        }
+        const raw = conv.currentId;
+        result.currentId = typeof raw === "function" ? raw() : raw;
+        const current = typeof conv.current === "function" ? conv.current() : conv.current;
+        result.currentInfoId = current && current.info ? current.info.id : null;
+      } catch (error) {
+        result.currentId = "ERR " + String(error && error.message || error).slice(0, 80);
+      }
+      return result;
+    };
+    const original = globalThis.__wbInvoke;
+
+    // 浏览器端首页没有“当前工作区”上下文，点新建任务时 create 传的 cwd 是空字符串。
+    // daemon 拿到空 cwd 就算不出 owner key，日志里是：
+    //   wb:conversations:create arg={"cwd":""}
+    //   [LocalConversationHistorySource] history-missing  fallbackReason:"shared-enoent-owner-key-unavailable"
+    // 结果是会话建出来了、sessions 表里有记录，但没有对应 jsonl，也连不上本地运行时；
+    // 之后每次读取都抛 e.content.map is not a function，界面上就是
+    // 「会话记录损坏，请新建任务 4010」和「未知错误 暂无响应」。
+    // 这里在 create 前把空 cwd 补成一个真实存在的工作区路径。
+    let __wbCreateCwdCache = { at: 0, cwd: "" };
+    const resolveCreateCwd = async () => {
+      // 1) 人工指定优先
+      const forced = globalThis.__wbRemoteCreateCwd;
+      if (typeof forced === "string" && forced.trim()) {
+        return forced.trim();
+      }
+      // 2) 上次在远程页面里打开过的工作区
+      try {
+        const remembered = globalThis.localStorage?.getItem("wb:remote-create-cwd");
+        if (remembered && remembered.trim()) {
+          return remembered.trim();
+        }
+      } catch {}
+      // 3) 最近打开的工作区（10 秒内复用同一个结果，避免每次 create 都打一次 IPC）
+      if (__wbCreateCwdCache.cwd && Date.now() - __wbCreateCwdCache.at < 10000) {
+        return __wbCreateCwdCache.cwd;
+      }
+      try {
+        const listed = await original("wb:workspaces:list");
+        const items = listed && Array.isArray(listed.items) ? listed.items : [];
+        const first = items.find((item) => item && typeof item.path === "string" && item.path.trim());
+        if (first) {
+          __wbCreateCwdCache = { at: Date.now(), cwd: first.path };
+          return first.path;
+        }
+      } catch {}
+      // 4) 兜底：默认工作区根目录
+      try {
+        const state = await original("wb:workspaces:getDefaultPathState");
+        const fallback =
+          (state && (state.configuredPath || state.effectivePath || state.systemDefaultPath)) || "";
+        if (fallback && fallback.trim()) {
+          __wbCreateCwdCache = { at: Date.now(), cwd: fallback };
+          return fallback;
+        }
+      } catch {}
+      return "";
+    };
+
+    globalThis.__wbInvoke = async (channel, context, ...args) => {
+      if (channel === "wb:conversations:create") {
+        try {
+          const head = args[0];
+          if (head && typeof head === "object" && !Array.isArray(head) && !head.cwd) {
+            const cwd = await resolveCreateCwd();
+            if (cwd) {
+              args = [{ ...head, cwd }, ...args.slice(1)];
+              console.warn("[WbCreateCwd] injected cwd=" + cwd);
+            } else {
+              console.warn("[WbCreateCwd] no workspace available, cwd stays empty");
+            }
+          }
+        } catch (error) {
+          console.warn("[WbCreateCwd] inject failed: " + String((error && error.message) || error));
+        }
+        const report = globalThis.__wbDiag;
+        const built = await original(channel, context, ...args);
+        const createdId =
+          (built && (built.id || (built.info && built.info.id))) || null;
+        try {
+          if (typeof report === "function") {
+            report("create.result", {
+              keys: built && typeof built === "object" ? Object.keys(built).slice(0, 30) : null,
+              type: typeof built,
+              id: createdId,
+            });
+          }
+        } catch (error) {
+          void error;
+        }
+        try {
+          if (createdId && typeof globalThis.__wbOnHomeConversationCreated === "function") {
+            globalThis.__wbOnHomeConversationCreated(createdId);
+          }
+        } catch (error) {
+          void error;
+        }
+        return built;
+      }
+      if (view.has(channel) && typeof args[0] === "string") {
+        lastViewed.id = args[0];
+        lastViewed.channel = channel;
+        lastViewed.at = Date.now();
+      }
+      if (!watch.has(channel)) {
+        return original(channel, context, ...args);
+      }
+      const report = globalThis.__wbDiag;
+      const ids = readIds();
+      if (typeof report === "function") {
+        report("send.path", {
+          channel: channel,
+          arg0: describe(args[0]),
+          arg1: Array.isArray(args[1]) ? "blocks:" + args[1].length : describe(args[1]),
+          currentId: ids.currentId,
+          currentInfoId: ids.currentInfoId,
+          lastViewedId: lastViewed.id,
+          lastViewedChannel: lastViewed.channel,
+          lastViewedAgoMs: lastViewed.at ? Date.now() - lastViewed.at : null,
+          hash: String(location.hash || "").slice(0, 120),
+          path: String(location.pathname || "").slice(0, 80),
+        });
+      }
+      return original(channel, context, ...args);
+    };
+  })();
+
+  // ===== 观测新建任务提交动作 (temporary) =====
+  (() => {
+    let lastReportAt = 0;
+    const report = (tag, extra) => {
+      const emit = globalThis.__wbDiag;
+      if (typeof emit !== "function") {
+        return;
+      }
+      const prewarm = globalThis.__wbHomeTaskPrewarm__;
+      const conv = globalThis.wb && globalThis.wb.conversations;
+      let currentId = null;
+      try {
+        const raw = conv && conv.currentId;
+        currentId = typeof raw === "function" ? raw() : raw;
+      } catch (error) {
+        currentId = "ERR";
+      }
+      emit(tag, {
+        prewarm: prewarm && typeof prewarm === "object" ? {
+          keys: Object.keys(prewarm).slice(0, 10),
+          conversationId: prewarm.entry && prewarm.entry.conversationId,
+          inFlight: prewarm.inFlight,
+        } : String(prewarm),
+        currentId: currentId,
+        actives: document.activeElement ? String(document.activeElement.tagName) : null,
+        editableLength: (() => {
+          const el = document.activeElement;
+          if (!el) {
+            return null;
+          }
+          const text = el.innerText !== undefined ? el.innerText : el.value;
+          return typeof text === "string" ? text.trim().length : null;
+        })(),
+        ...extra,
+      });
+    };
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.shiftKey) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastReportAt < 800) {
+        return;
+      }
+      lastReportAt = now;
+      report("submit.keydown");
+    }, true);
+
+    // console 错误（前端吞异常最常见的出口）
+    const seen = new Set();
+    for (const level of ["error", "warn"]) {
+      const originalLog = console[level];
+      if (typeof originalLog !== "function") {
+        continue;
+      }
+      console[level] = function (...params) {
+        try {
+          if (seen.size < 30) {
+            const text = params
+              .map((item) => {
+                if (typeof item === "string") {
+                  return item;
+                }
+                if (item instanceof Error) {
+                  return item.message + " @ " + String(item.stack || "").slice(0, 300);
+                }
+                try {
+                  return JSON.stringify(item);
+                } catch (error) {
+                  return String(item);
+                }
+              })
+              .join(" ")
+              .slice(0, 500);
+            const key = level + "|" + text.slice(0, 160);
+            if (!seen.has(key)) {
+              seen.add(key);
+              const emit = globalThis.__wbDiag;
+              if (typeof emit === "function") {
+                emit("console." + level, { text: text });
+              }
+            }
+          }
+        } catch (error) {
+          void error;
+        }
+        return originalLog.apply(console, params);
+      };
+    }
+
+    // 路由跳转 / 卸载观测
+    try {
+      for (const method of ["pushState", "replaceState"]) {
+        const originalHistory = history[method];
+        if (typeof originalHistory !== "function") {
+          continue;
+        }
+        history[method] = function (...params) {
+          const emit = globalThis.__wbDiag;
+          if (typeof emit === "function") {
+            emit("nav." + method, { url: String(params[2] || "").slice(0, 200) });
+          }
+          return originalHistory.apply(history, params);
+        };
+      }
+      window.addEventListener("beforeunload", () => {
+        const emit = globalThis.__wbDiag;
+        if (typeof emit === "function") {
+          emit("nav.unload", { url: String(location.href).slice(0, 200) });
+        }
+      });
+      window.addEventListener("popstate", () => {
+        const emit = globalThis.__wbDiag;
+        if (typeof emit === "function") {
+          emit("nav.popstate", { url: String(location.href).slice(0, 200) });
+        }
+      });
+    } catch (error) {
+      void error;
+    }
+  })();
+
+  // ===== 首页“新建任务”提交兜底 =====
+  // 远程浏览器里，首页组件在 create 之后既不发消息也不跳转：ownsSubmissionSurface() 恒为 false，
+  // 于是 v({type:"conversation-created", select:ownsSubmissionSurface()}) 把会话建成“未选中”，
+  // 首条消息永远发不出去（会话有标题、状态 idle、内容是空的，且没有任何报错）。
+  // 补丁本可以改这个判定，但该 chunk 带 immutable 强缓存，浏览器不会回源。
+  // 所以改为在这里接管：拿到 create 的会话 id 后，若仍在 idle 就自己把草稿发进去，
+  // 远程页面里新建的会话默认没有本地运行时：浏览器端首页创建会话时不会拉起本地 CLI 进程，
+  // 消息只是进了队列，既不会执行也不会写出 jsonl。日志对比很明确——
+  //   成功会话 b00c641f：ensureRuntime 出现 1 次
+  //   失败会话 5e9ad5d7：ensureRuntime 出现 0 次
+  // 没有运行时的直接后果就是之后读取历史抛 e.content.map is not a function，
+  // 界面上表现为「会话记录损坏，请新建任务 4010」/「未知错误 暂无响应」。
+  // 这里统一提供一个“确保运行时”入口，跳转会话和兜底发送之前都先调一次。
+  globalThis.__wbEnsureRuntime = async (id) => {
+    if (!id) {
+      return false;
+    }
+    const invoke = globalThis.__wbInvoke;
+    if (typeof invoke !== "function") {
+      return false;
+    }
+    try {
+      await invoke("wb:conversations:ensureRuntime", null, id);
+      try {
+        console.warn("[WbEnsureRuntime] ok " + id);
+      } catch (error) {}
+      return true;
+    } catch (error) {
+      try {
+        console.warn(
+          "[WbEnsureRuntime] fail " + id + " " + String((error && error.message) || error)
+        );
+      } catch (error2) {}
+      return false;
+    }
+  };
+
+  // 手动点侧边栏切换会话时也确保运行时在线：浏览器端切过去的会话如果本来没有
+  // 本地 CLI 进程，就会停在空白页并报「未知错误 暂无响应」。
+  // 这里做点击级兜底，同一会话 60 秒内只踢一次，避免反复调用。
+  (function __wbInstallRuntimeOnSwitch() {
+    if (globalThis.__wbRuntimeOnSwitchInstalled) {
+      return;
+    }
+    globalThis.__wbRuntimeOnSwitchInstalled = true;
+    const asked = new Map();
+    document.addEventListener(
+      "click",
+      (event) => {
+        try {
+          const node =
+            event.target && event.target.closest
+              ? event.target.closest("[data-conversation-id]")
+              : null;
+          const id = node && node.dataset ? node.dataset.conversationId : "";
+          if (!id) {
+            return;
+          }
+          const last = asked.get(id) || 0;
+          if (Date.now() - last < 60000) {
+            return;
+          }
+          asked.set(id, Date.now());
+          if (typeof globalThis.__wbEnsureRuntime === "function") {
+            Promise.resolve(globalThis.__wbEnsureRuntime(id)).catch(() => {});
+          }
+        } catch (error) {}
+      },
+      true
+    );
+  })();
+
+  // 确认落库后整页重载并用 ?openConv= 点开该会话（见 __wbOpenConversationFromQuery）。
+  (function __wbHomeSubmitWatchdog() {
+    if (globalThis.__wbHomeWatchdogInstalled) {
+      return;
+    }
+    globalThis.__wbHomeWatchdogInstalled = true;
+
+    const log = (tag, extra) => {
+      try {
+        console.warn("[WbHomeSend] " + tag + (extra ? " " + JSON.stringify(extra) : ""));
+      } catch (error) {}
+      try {
+        if (typeof globalThis.__wbDiag === "function") {
+          globalThis.__wbDiag("home." + tag, extra || {});
+        }
+      } catch (error) {}
+    };
+
+    let draft = "";
+    let draftAt = 0;
+    let sentConversationId = "";
+    const seen = new Set();
+
+    const readEditor = (node) => {
+      try {
+        const read = (element) => {
+          if (!element) {
+            return "";
+          }
+          const tag = String(element.tagName || "").toUpperCase();
+          const value =
+            tag === "TEXTAREA" || tag === "INPUT" ? element.value : element.innerText;
+          return typeof value === "string" ? value.trim() : "";
+        };
+        if (node && node.nodeType === 1) {
+          const direct = read(node);
+          if (direct) {
+            return direct;
+          }
+          const host = node.closest ? node.closest('[contenteditable="true"]') : null;
+          if (host) {
+            return read(host);
+          }
+        }
+        return read(document.activeElement) || read(document.querySelector('[contenteditable="true"]'));
+      } catch (error) {
+        return "";
+      }
+    };
+
+    const rememberDraft = (node) => {
+      const text = readEditor(node);
+      if (!text || text.length > 20000) {
+        return;
+      }
+      if (text !== draft) {
+        sentConversationId = "";
+      }
+      draft = text;
+      draftAt = Date.now();
+    };
+
+    // 捕获阶段先于 React 的 onSubmit 执行，避免编辑器被清空后才读到空字符串。
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
+          return;
+        }
+        rememberDraft(event.target);
+      },
+      true
+    );
+    document.addEventListener(
+      "click",
+      (event) => {
+        try {
+          const node = event.target;
+          const button =
+            node && node.closest
+              ? node.closest('[aria-label="发送"],[aria-label="Send"],[data-testid*="send"]')
+              : null;
+          if (button) {
+            rememberDraft(document.querySelector('[contenteditable="true"]'));
+          }
+        } catch (error) {}
+      },
+      true
+    );
+
+    const inspect = async (id) => {
+      const conversations = globalThis.wb && globalThis.wb.conversations;
+      if (!conversations || typeof conversations.get !== "function") {
+        return null;
+      }
+      let handle = null;
+      try {
+        handle = await conversations.get(id);
+      } catch (error) {
+        return null;
+      }
+      if (!handle) {
+        return null;
+      }
+      const state = handle.info && handle.info.state ? String(handle.info.state) : null;
+      let count = null;
+      try {
+        const prompts = await handle.userPrompts();
+        if (Array.isArray(prompts)) {
+          count = prompts.length;
+        }
+      } catch (error) {
+        count = null;
+      }
+      return { handle, state, count };
+    };
+
+    const navigateLater = (id) => {
+      log("navigate", { id });
+      setTimeout(() => {
+        try {
+          location.replace("/agent-manager/?openConv=" + encodeURIComponent(id));
+        } catch (error) {
+          log("navigate-failed", { message: String(error && error.message) });
+        }
+      }, 320);
+    };
+
+    const watch = (id) => {
+      if (!id || seen.has(id)) {
+        return;
+      }
+      seen.add(id);
+      const startedAt = Date.now();
+      let sentAt = 0;
+      let tried = false;
+      let done = false;
+      let runtimeAsked = false;
+
+      const tick = async () => {
+        if (done) {
+          return;
+        }
+        const elapsed = Date.now() - startedAt;
+        // 尽早把运行时拉起来（不阻塞）：原生流程的 sendPrompt 只负责入队，
+        // 真正执行要等本地 CLI 就绪。这里在 300ms 就先踢一脚。
+        if (!runtimeAsked && elapsed > 300) {
+          runtimeAsked = true;
+          try {
+            if (typeof globalThis.__wbEnsureRuntime === "function") {
+              Promise.resolve(globalThis.__wbEnsureRuntime(id)).catch(() => {});
+            }
+          } catch (error) {}
+        }
+        const info = await inspect(id);
+        if (!info) {
+          // 有的 create 只是预创建/占位，最终并不存在，给它 3s 观察窗口再放弃。
+          if (elapsed < 3000) {
+            setTimeout(tick, 300);
+            return;
+          }
+          done = true;
+          log("skip-missing", { id });
+          return;
+        }
+
+        // 只有两种情况算“已经发出去了”：
+        // 1) 会话里确实存在用户消息（count > 0）—— 最硬的证据；
+        // 2) 我们自己已经调用过 sendPrompt，且状态转为 working。
+        // 不能只看 state==="working"：新建会话时状态可能在消息真正派发前就先变成
+        // working，据此判定会导致“以为发出去了”，实际是空会话。
+        const hasPrompt = typeof info.count === "number" && info.count > 0;
+        const running = hasPrompt || (tried && info.state === "working");
+        if (running) {
+          done = true;
+          log("confirmed", {
+            id,
+            state: info.state,
+            count: info.count,
+            sentByShim: tried,
+            elapsedMs: elapsed,
+          });
+          navigateLater(id);
+          return;
+        }
+
+        if (!tried) {
+          // 先让原生流程有 1.6s 自行发送的机会，避免双发。
+          if (elapsed < 1600) {
+            setTimeout(tick, 300);
+            return;
+          }
+          if (sentConversationId && sentConversationId !== id) {
+            done = true;
+            log("skip-other-sent", { id });
+            return;
+          }
+          if (!draft || Date.now() - draftAt > 120000) {
+            done = true;
+            log("no-draft", { id });
+            return;
+          }
+          if (typeof info.handle.sendPrompt !== "function") {
+            done = true;
+            log("no-sendPrompt", { id });
+            return;
+          }
+          tried = true;
+          sentConversationId = id;
+          // 先把本地运行时拉起来，否则 sendPrompt 只会进队列、永远不执行。
+          try {
+            if (typeof globalThis.__wbEnsureRuntime === "function") {
+              log("ensure-runtime-before-send", { id });
+              await globalThis.__wbEnsureRuntime(id);
+            }
+          } catch (error) {}
+          // 关键：handle.sendPrompt 的第一个参数必须是 content blocks 数组。
+          // 传纯字符串会在派发阶段抛 e.content.map is not a function，
+          // 消息既发不出去、也不会有任何错误提示（界面只显示“暂无对话记录”）。
+          const blocks = [{ type: "text", text: draft }];
+          try {
+            const conversations = globalThis.wb && globalThis.wb.conversations;
+            if (conversations && typeof conversations.setCurrentConversation === "function") {
+              try {
+                await conversations.setCurrentConversation(id);
+              } catch (error) {
+                log("set-current-failed", { message: String(error && error.message) });
+              }
+            }
+          } catch (error) {}
+          try {
+            await info.handle.sendPrompt(blocks);
+            sentAt = Date.now();
+            log("sent", { id, length: draft.length, blocks: blocks.length });
+          } catch (error) {
+            done = true;
+            sentConversationId = "";
+            log("send-failed", { id, message: String(error && error.message) });
+            return;
+          }
+          setTimeout(tick, 400);
+          return;
+        }
+
+        // 已发送但状态迟迟没变（例如上游排队），最多等 10s 仍然跳过去，让用户自己看结果。
+        if (sentAt && Date.now() - sentAt > 10000) {
+          done = true;
+          log("unconfirmed", { id, state: info.state });
+          navigateLater(id);
+          return;
+        }
+        setTimeout(tick, 400);
+      };
+
+      setTimeout(tick, 200);
+    };
+
+    globalThis.__wbOnHomeConversationCreated = (id) => {
+      try {
+        if (!id) {
+          return;
+        }
+        // 注意：这份 shim 本体是一段模板字符串，正则里的反斜杠会被吃掉，
+        // 所以这里用 indexOf 判断路径，不要写带转义的正则。
+        if (location.pathname.indexOf("/agent-manager") !== 0) {
+          return;
+        }
+        if (!draft || Date.now() - draftAt > 6000) {
+          // 草稿不是刚刚提交的（预创建、或首页之外的 create）：交给原生流程。
+          return;
+        }
+        log("created", { id, draftLength: draft.length });
+        watch(id);
+      } catch (error) {}
+    };
+  })();
+
   globalThis.__wbEventBridge = (callback) => {
     globalThis.__wbEventBridgeCallback = callback;
     return () => {
@@ -4617,6 +5687,82 @@ function renderWorkBuddyNativeShimJs({
       return file?.path || file?.name || "";
     },
   };
+
+  // 远程浏览器里新建任务提交之后，首页组件会被提交状态锁住：会话和消息都正常产生，
+  // 但视图切不过去，连侧边栏其它会话都点不动。唯一的可靠做法是整页重载回到干净状态，
+  // 再按 conversationId 点击侧边栏里那条会话（内存路由只认这个入口，地址栏不参与）。
+  (function __wbOpenConversationFromQuery() {
+    let target = "";
+    try {
+      target = new URLSearchParams(location.search).get("openConv") || "";
+    } catch (error) {}
+    if (!target) {
+      return;
+    }
+    // 提交后整页重载到干净状态，侧边栏要几秒才渲染出来。这段时间先盖一层提示，
+    // 免得看起来像卡死；点开目标会话后立刻移除。
+    const showMask = () => {
+      try {
+        if (document.getElementById("__wbOpenConvMask")) {
+          return;
+        }
+        const mask = document.createElement("div");
+        mask.id = "__wbOpenConvMask";
+        mask.style.cssText =
+          "position:fixed;inset:0;z-index:2147483647;background:rgba(255,255,255,.94);display:flex;align-items:center;justify-content:center;font:14px/1.7 system-ui,-apple-system,'Segoe UI',sans-serif;color:#666;letter-spacing:.02em";
+        mask.textContent = "正在打开新会话…";
+        (document.body || document.documentElement).appendChild(mask);
+      } catch (error) {}
+    };
+    const hideMask = () => {
+      try {
+        document.getElementById("__wbOpenConvMask")?.remove();
+      } catch (error) {}
+    };
+    showMask();
+    document.addEventListener("DOMContentLoaded", showMask, { once: true });
+    let tries = 0;
+    const tick = () => {
+      tries += 1;
+      let element = null;
+      try {
+        const matched = [...document.querySelectorAll("[data-conversation-id]")].filter(
+          (node) => node.dataset.conversationId === target
+        );
+        element = matched.find((node) => node.getAttribute("role") === "button") || matched.pop();
+      } catch (error) {}
+      if (element) {
+        try {
+          element.click();
+        } catch (error) {}
+        try {
+          const url = new URL(location.href);
+          url.searchParams.delete("openConv");
+          history.replaceState(history.state, "", url.pathname + (url.search || ""));
+        } catch (error) {}
+        hideMask();
+        try {
+          console.warn("[WbOpenConv] clicked " + target + " attempts=" + tries);
+        } catch (error) {}
+        // 点开之后立刻确保运行时在线：否则会话页面是空的，发消息也没人执行。
+        try {
+          if (typeof globalThis.__wbEnsureRuntime === "function") {
+            globalThis.__wbEnsureRuntime(target);
+          }
+        } catch (error) {}
+        return;
+      }
+      if (tries < 150) {
+        setTimeout(tick, 100);
+        return;
+      }
+      hideMask();
+      try {
+        console.warn("[WbOpenConv] timeout " + target);
+      } catch (error) {}
+    };
+    setTimeout(tick, 200);
+  })();
 })();`;
 }
 
