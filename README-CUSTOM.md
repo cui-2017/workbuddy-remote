@@ -57,13 +57,13 @@ await handle.sendPrompt([{ type: "text", text: draft }]);
 ### 2. 拉代码
 
 ```bash
-git clone -b custom/browser-remote <你的仓库地址> workbuddy-remote
+git clone -b custom/browser-remote https://github.com/cui-2017/workbuddy-remote.git workbuddy-remote
 cd workbuddy-remote
 npm install
 ```
 
-> 若无法访问自有仓库，也可用上游代码 + 本分支的 patch：
-> `git clone https://github.com/flyibeat/workbuddy-remote.git && git am 0001-*.patch`
+> 仓库已配置两个 remote：`origin` = 自己的 fork，`upstream` = 原项目 `flyibeat/workbuddy-remote`。
+> 若无法访问 GitHub，也可用上游代码 + 离线补丁：`git am 0001-*.patch`
 
 ### 3. 配置
 
@@ -129,7 +129,12 @@ curl -s  http://127.0.0.1:8780/bridge/workbuddy-native-shim.js | wc -c   # 应 >
 ```bash
 git fetch upstream
 git rebase upstream/main          # 冲突集中在 shim 与 bridge-server 的补丁段
+git push origin custom/browser-remote
 ```
+
+> **代理注意**：若 `git` 访问 GitHub 报 `CONNECT tunnel failed, response 502`，
+> 多为环境变量里的代理端口失效（本机曾出现 `HTTPS_PROXY=127.0.0.1:2549` 对 github.com 返回 502）。
+> 临时改用可用端口即可：`export HTTPS_PROXY=http://127.0.0.1:7890`。
 
 ### 出问题先看哪里
 
