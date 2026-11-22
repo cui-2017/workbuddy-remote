@@ -14,6 +14,7 @@
 |---|---|---|---|
 | **P0** | 静态资源缓存 | 改了代码但行为完全不变 | 响应头是否为 `immutable` |
 | **P0** | 发送参数格式 | 有会话、无内容、无报错 | 日志有 `sendPrompt.dispatch-failed` |
+| **P1** | CDP target 选择 | 页面能打开，点什么都没反应 | 日志有 `cdp.target.fallback` |
 | **P1** | 会话 cwd | 会话建了，点开报"记录损坏 4010" | `create arg={"cwd":""}` |
 | **P1** | 运行时启动 | 状态一直 idle，消息不执行 | SDK 日志无 `ensureRuntime` |
 | **P1** | 会话选中状态 | 首条消息不启动 | `conversation-created select=false` |
@@ -72,6 +73,35 @@ sendPrompt.dispatch-failed {"reason":"e.content.map is not a function"}  ← 2ms
 
 1. `handle.userPrompts()` 返回的数组长度 > 0
 2. 会话 jsonl 里存在 `type: "message"` 的记录
+
+---
+
+### P1-0 CDP target 选择（多窗口陷阱）
+
+WorkBuddy 是**多窗口架构**：设置、全局搜索、图片查看器、微信聊天记录等
+都是独立的 BrowserWindow，加载同一份 `renderer/index.html`，仅靠 URL 参数区分：
+
+```
+windowAppId=settings / windowKind=settings / windowPreset=utility
+```
+
+早期实现用 `targets.filter(isWorkBuddyRendererTarget).at(-1)` 取**最后一个**。
+由于设置窗口同样是 index.html，一旦它是在主窗口之后打开的，
+重启 bridge 就会把 CDP 连到设置窗口上 —— 表现为**网页能正常打开，但点什么都没反应**。
+
+**判据**：bridge 日志出现 `cdp.target.fallback`（说明没找到主窗口，只能将就）。
+
+**修复**：优先选 `windowKind` 为空或等于 `main` 的 target，取不到才回退：
+
+```js
+const renderers = targets.filter(isWorkBuddyRendererTarget);
+const mainTargets = renderers.filter(isMainWindowTarget); // windowKind 为空或 main
+const target = mainTargets.at(-1) || renderers.at(-1);
+```
+
+**为什么不支持多窗口**：设置页/加油站里的原生调用（文件选择、目录选择、系统信息）
+在浏览器里没有等价物，逐个兜底的成本远高于收益，且随客户端升级反复失效。
+低频场景直接走 RDP 更划算。
 
 ---
 
@@ -172,4 +202,9 @@ C:\Users\MSI\WorkBuddy\2026-11-19-19-40-51
 3. 改了代码但行为没变
    └─ curl -I <资源url> | grep -i cache-control
       └─ 含 immutable → P0-1
+
+4. 页面能打开，但点击/输入全都无反应
+   └─ grep "cdp.target.fallback" bridge-*.events.log | tail
+      ├─ 有 → 连到设置窗口了（P1-0）
+      └─ 无 → 看 bridge.wb_invoke 是否在转发，再查 shim 是否注入成功
 ```

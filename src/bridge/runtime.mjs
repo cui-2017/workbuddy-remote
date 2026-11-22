@@ -1157,6 +1157,32 @@ function isWorkBuddyRendererTarget(entry) {
   );
 }
 
+// WorkBuddy 是多窗口架构：设置、全局搜索、图片查看器等都是独立的 BrowserWindow，
+// 加载同一份 renderer/index.html，仅靠 URL 上的 windowKind 区分。
+// 主窗口不带 windowKind 参数（只有 locale / wbSeedToken / accountSnapshot），
+// 部分版本会显式写 windowKind=main。
+function readWindowKind(entry) {
+  const url = typeof entry?.url === "string" ? entry.url : "";
+  const match = url.match(/[?&]windowKind=([^&]*)/);
+  if (!match) {
+    return "";
+  }
+  const raw = match[1];
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function isMainWindowTarget(entry) {
+  if (!isWorkBuddyRendererTarget(entry)) {
+    return false;
+  }
+  const kind = readWindowKind(entry);
+  return kind === "" || kind === "main";
+}
+
 async function getWorkBuddyTarget({
   cdpHost,
   cdpPort,
@@ -1176,9 +1202,24 @@ async function getWorkBuddyTarget({
 
       const targets = await response.json();
       lastTargets = Array.isArray(targets) ? targets : [];
-      const target = lastTargets.filter(isWorkBuddyRendererTarget).at(-1);
+      // 关键：不能直接 .at(-1)。设置窗口同样是 index.html 页面，
+      // 若它恰好在主窗口之后打开，取最后一个会把 CDP 连到设置窗口上，
+      // 表现为"网页能打开但点什么都没反应"。这里优先选主窗口，取不到才回退。
+      const renderers = lastTargets.filter(isWorkBuddyRendererTarget);
+      const mainTargets = renderers.filter(isMainWindowTarget);
+      const target = mainTargets.at(-1) || renderers.at(-1);
 
       if (target?.webSocketDebuggerUrl) {
+        if (mainTargets.length === 0) {
+          logger.warn(
+            "cdp.target.fallback",
+            "No main-window target found; falling back to another WorkBuddy renderer",
+            {
+              chosenWindowKind: readWindowKind(target) || "(none)",
+              rendererCount: renderers.length,
+            }
+          );
+        }
         return target;
       }
     } catch (error) {
