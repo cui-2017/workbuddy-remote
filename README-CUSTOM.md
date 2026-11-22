@@ -141,6 +141,20 @@ git push origin custom/browser-remote
 一律先读 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) 的「五分钟定位流程」，
 按 P0 → P2 顺序排查，不要从业务代码开始猜。
 
+### 日志体积
+
+`WORKBUDDY_REMOTE_LOG_LEVEL=debug` 下事件日志增长很快（曾跑到 181 MB）。
+建议在启动脚本里加一段轮转：超过 50 MB 时只保留最后 5 MB。参考实现：
+
+```bash
+if [ -f "$LOG" ]; then
+  SIZE=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  if [ "$SIZE" -gt 52428800 ]; then
+    tail -c 5242880 "$LOG" > "${LOG}.rot" && mv -f "${LOG}.rot" "$LOG"
+  fi
+fi
+```
+
 ---
 
 ## 四、已知限制
